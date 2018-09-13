@@ -42,7 +42,12 @@ class sent_model:
 		self.tf_word_ids = tf.placeholder(dtype=tf.int32, shape=[None, None], name="word_ids")
 		# real word lengths in sents
 		self.tf_sentence_lengths= tf.placeholder(dtype=tf.int32, shape=[None], name="sentence_lengths")
-
+		# mask for attention weight
+		self.mask = tf.where(
+							condition=tf.equal(self.tf_word_ids, self.w2i["<PAD>"]),
+							x=tf.ones_like(self.tf_word_ids, dtype=tf.float32)*np.float32(-1e+10),
+							y=tf.ones_like(self.tf_word_ids, dtype=tf.float32)
+							)
 		# [batch size, nb_words, nb_chars]
 		self.tf_char_ids = tf.placeholder(dtype=tf.int32, shape=[None, None, None], name="char_ids")
 
@@ -142,7 +147,8 @@ class sent_model:
 			e1 = tf.transpose(tf.tensordot(x, w1, axes=1), [1,0,2]) # b, n, de -> n, b, de = n, [b,de]
 			e2 = tf.transpose(tf.tensordot(x, w2, axes=1), [1,0,2]) # b, n, de -> n, b, de
 			tong = tf.transpose(tf.map_fn(lambda i: i + e2 + b1, e1), [2,0,1,3]) # b, n, n, de
-			weight = tf.nn.softmax(tf.tensordot(tf.tanh(tong), w, axes=1) + b) # b, n, n
+			e_ = tf.tensordot(tf.tanh(tong), w, axes=1) + b # b, n, n
+			weight = tf.nn.softmax(tf.einsum("ijk,ik->ijk", e_, self.mask)) # b, n, n
 			h = tf.transpose(tf.map_fn(lambda y: y*x,tf.expand_dims(tf.transpose(weight, [1,0,2]), -1)), [1,0,2,3])
 						
 		with tf.variable_scope("loss_and_opt"):
