@@ -97,7 +97,8 @@ class sent_model:
 										name="conv3",
 										kernel_initializer=xavier_initializer_conv2d())
 
-			char_cnn = tf.nn.dropout(tf.reduce_max(conv3, axis=2), self.tf_keep_prob)
+			# char_cnn = tf.nn.dropout(tf.reduce_max(conv3, axis=2), self.tf_keep_prob)
+			char_cnn = tf.reduce_max(conv3, axis=2)
 			
 			self.input = tf.concat([self.input, char_cnn], axis=-1) # [sents, words, features]
 
@@ -128,25 +129,36 @@ class sent_model:
 			
 			c = tf.reshape(c, (self.batch_size, -1, 2*self.lstm_num_units))	# [nb_documents, nb_sents, 2*lstm_units]	
 
-			# self.c1 = tf.layers.conv1d(inputs=self.c, filters=2*self.lstm_num_units, kernel_size=3, padding='same')
+			c0 = tf.layers.conv1d(inputs=c, filters=256, kernel_size=5, padding='same')
+			c1 = tf.layers.conv1d(inputs=c0, filters=128, kernel_size=3, padding='same')
 
-		with tf.variable_scope("self_att"):
-			x = c
-			de = x.get_shape()[-1]
-			w = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="w")
-			w1 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W1")
-			w2 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W2")
-			b1 = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="b1")
-			b = tf.get_variable(dtype=tf.float32, shape=[], trainable=True, name="b")
+		with tf.variable_scope("just_pair"):
+			d = tf.expand_dims(c1, 1)
+			e = tf.tile(d, (1, tf.shape(c1)[1], 1, 1))
 
-			e1 = tf.transpose(tf.tensordot(x, w1, axes=1), [1,0,2]) # b, n, de -> n, b, de = n, [b,de]
-			e2 = tf.transpose(tf.tensordot(x, w2, axes=1), [1,0,2]) # b, n, de -> n, b, de
-			tong = tf.transpose(tf.map_fn(lambda i: i + e2 + b1, e1), [2,0,1,3]) # b, n, n, de
-			weight = tf.nn.softmax(tf.tensordot(tf.tanh(tong), w, axes=1) + b) # b, n, n
-			h = tf.transpose(tf.map_fn(lambda y: y*x,tf.expand_dims(tf.transpose(weight, [1,0,2]), -1)), [1,0,2,3])
+			f = tf.expand_dims(c1, 2)
+			g = tf.tile(f, (1, 1, tf.shape(c1)[1], 1))
+
+			# [nb_documents, nb_sents, nb_sents, 4*lstm_units]
+			h = tf.concat([e, g], axis=-1)
+
+		# with tf.variable_scope("self_att"):
+		# 	x = c2 #b, n, de
+		# 	de = x.get_shape()[-1]
+		# 	w = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="w")
+		# 	w1 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W1")
+		# 	w2 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W2")
+		# 	b1 = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="b1")
+		# 	b = tf.get_variable(dtype=tf.float32, shape=[], trainable=True, name="b")
+
+		# 	e1 = tf.transpose(tf.tensordot(x, w1, axes=1), [1,0,2]) # b, n, de -> n, b, de = n, [b,de]
+		# 	e2 = tf.transpose(tf.tensordot(x, w2, axes=1), [1,0,2]) # b, n, de -> n, b, de
+		# 	tong = tf.transpose(tf.map_fn(lambda i: i + e2 + b1, e1), [2,0,1,3]) # b, n, n, de
+		# 	weight = tf.nn.softmax(tf.tensordot(tf.tanh(tong), w, axes=1) + b) # b, n, n
+		# 	h = tf.transpose(tf.map_fn(lambda y: y*x,tf.expand_dims(tf.transpose(weight, [1,0,2]), -1)), [1,0,2,3])
 						
 		with tf.variable_scope("loss_and_opt"):
-			self.logits = tf.layers.dense(inputs=h, units=2, activation=None)
+			self.logits = tf.nn.dropout(tf.layers.dense(inputs=h, units=2, activation=None), self.tf_keep_prob)
 
 			self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=tf.one_hot(self.tf_target_matrix, 2),
 														   logits=self.logits,
@@ -204,6 +216,8 @@ class sent_model:
 			if "load_path" in self.params and self.params["load_path"] != "":
 				print("Model is loaded from {}".format(self.params["load_path"]))
 				saver.restore(sess, self.params["load_path"])
+				max_acc = self.accuracy(sess, idx_words_dev, idx_chars_dev, raw_y_dev)				
+				print("The best acc on the dev. set:", max_acc)
 
 			print("Model params:", self.params)					
 
@@ -222,6 +236,18 @@ class sent_model:
 				avg_loss = []
 				while current_idx < nb_samples:
 					batch_words, real_length_sents, batch_chars, batch_labels, current_idx, doc_boundaries = self.get_batch(shuffled_idx_words, shuffled_idx_chars, shuffled_y, current_idx)
+
+					# print("\n\n======================================================\n\n")
+					# print(batch_words)
+					# print("\n\n------------------------------------------------------n\n")
+					# print(real_length_sents)
+					# print("\n\n------------------------------------------------------n\n")
+					# print(batch_chars)
+					# print("\n\n------------------------------------------------------n\n")
+					# print(batch_labels)
+					# print("\n\n------------------------------------------------------n\n")
+					# print(doc_boundaries)
+					# print("\n\n$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n\n")
 					if batch_labels.shape[0] < self.batch_size:
 						break
 
@@ -240,16 +266,26 @@ class sent_model:
 				# acc_dev, _ = self.accuracy(sess, idx_words_dev, idx_chars_dev, raw_y_dev)
 				# acc_train, _ = self.accuracy(sess, idx_words_train, idx_chars_train, raw_y_train)
 				# acc_test, _ = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
+				# print("\n\n======================================================\n\n")
+				# print(idx_words_train[:1])
+				# print("\n\n------------------------------------------------------n\n")
+				# print(idx_chars_train[:1])
+				# print("\n\n------------------------------------------------------n\n")
+				# for i in range(5):
+				# 	print(raw_y_train[i])
+				# # for i in np.array(raw_y_train[:5]):
+				# # 	print(i.shape)
+				# print("\n\n======================================================\n\n")
 				acc_dev = self.accuracy(sess, idx_words_dev, idx_chars_dev, raw_y_dev)
 				acc_train = self.accuracy(sess, idx_words_train, idx_chars_train, raw_y_train)
 				acc_test = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
 
 				if max_acc < acc_dev:
 					saver.save(sess, self.params["save_path"])	
-					max_acc = acc_train
-					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {}, dev. set: {}, test. set: {} (Saved)".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
+					max_acc = acc_dev
+					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {:.4f}, dev. set: {:.4f}, test. set: {:.4f} (Saved)".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
 				else:
-					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {}, dev. set: {}, test. set: {}".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
+					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {:.4f}, dev. set: {:.4f}, test. set: {:.4f}".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
 
 			# print("acc on the test set:", self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test))
 		
@@ -345,15 +381,22 @@ class sent_model:
 		if end_idx > nb_samples:
 			end_idx = nb_samples
 
-		# sample -> sent -> word
-		batch_words = words[start_idx: end_idx]
+		# # sample -> sent -> word
+		# batch_words = words[start_idx: end_idx]
+		batch_words = [[[word for word in sent] for sent in sample] for sample in words[start_idx: end_idx]]
 
-		# sample -> sent -> word -> char		
-		batch_chars = chars[start_idx: end_idx]
+		# index characters: sample -> sent -> word -> idx_char
+		batch_chars = [[[[char for char in word] for word in sent] for sent in sample] for sample in chars[start_idx: end_idx]]
 
-		# list of matrices [nb_sents, nb_sents]
+		# # sample -> sent -> word -> char		
+		# batch_chars = chars[start_idx: end_idx]
+
+		# # list of matrices [nb_sents, nb_sents]
 		batch_labels = labels[start_idx: end_idx]
+		# # sample -> sent -> word
 
+		
+		
 
 		# pad sentences
 		# find the number of words in the longest sentence of batch word, and store real length of sentences
@@ -415,7 +458,7 @@ class sent_model:
 
 		new_batch_words = np.array(new_batch_words)
 		new_batch_chars = np.array(new_batch_chars)
-		new_batch_labels = np.array(batch_labels)		
+		new_batch_labels = np.array(batch_labels)				
 
 		return new_batch_words, real_length_sents, new_batch_chars, new_batch_labels, end_idx, doc_boundaries
 
@@ -504,29 +547,33 @@ class sent_model:
 			idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent]
 								for sent in sample] 
 								for sample in raw_x_test]			
+			# print("\n\n======================================================\n\n")
+			# print(idx_words_test[:1])
+			# print("\n\n------------------------------------------------------n\n")
+			# print(idx_chars_test[:1])
 
 			acc = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
-			print("acc on the {}: {}".format(test_file, acc))			
+			print("acc on the {}: {:.4f}".format(test_file, acc))			
 
 					
 params = {"dicts_file": "dict.pkl",
 		  "word_dim": 100, 
-		  "word_emb": "../../Documents/ner/pretrained_embeddings/glove.6B.100d.txt",
+		  # "word_emb": "../../Documents/ner/pretrained_embeddings/glove.6B.100d.txt",
 		  "char_dim": 32,
 		  "conv1": [2, 32],
 		  "conv2": [3, 64],
 		  "conv3": [4, 64],
 		  "lstm_num_units": 128,
 		  "keep_prob": 0.5,
-		  "batch_size": 3,
-		  "nb_epochs": 10,
-		  # "load_path":"./model/ontonotes",
-		  "save_path": "./model/ontonotes/ontonotes"}
+		  "batch_size": 1,
+		  "nb_epochs": 20,
+		  # "load_path":"./models/ontonotes/ontonotes",
+		  "save_path": "./models/ontonotes/ontonotes"}
 
 model = sent_model(params)
 
 model.train("train.pkl", "dev.pkl", "test.pkl")
-model.test("./model/ontonotes/ontonotes", "test.pkl")
+model.test("./models/ontonotes/ontonotes", "test.pkl")
 
 # params = {"dicts_file": "qbcoref_dict.pkl",
 # 		  "word_dim": 100, 
@@ -538,12 +585,12 @@ model.test("./model/ontonotes/ontonotes", "test.pkl")
 # 		  "lstm_num_units": 128,
 # 		  "keep_prob": 0.5,
 # 		  "batch_size": 5,
-# 		  "nb_epochs": 10,
-# 		  # "load_path":"./model/qbcoref",
-# 		  "save_path": "./model/qbcoref"}
+# 		  "nb_epochs": 20,
+# 		  "load_path":"./models/qbcoref/qbcoref",
+# 		  "save_path": "./models/qbcoref/qbcoref"}
 
 # model = sent_model(params)
 # model.train("qbcoref_train.pkl", "qbcoref_dev.pkl", "qbcoref_test.pkl")
-# model.test("./model/qbcoref", "qbcoref_test.pkl")
+# model.test("./models/qbcoref/qbcoref", "qbcoref_test.pkl")
 # # model.test("./model/ontonotes", "qbcoref_train.pkl", "out_qbcoref_train")
 
