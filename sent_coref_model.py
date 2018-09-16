@@ -19,18 +19,18 @@ class sent_model:
 		self.i2w = dicts["i2w"]
 		self.c2i = dicts["c2i"]
 		self.i2c = dicts["i2c"]		
-		print("Lengths of word and char dictionaries: {}, {}".format(len(self.w2i), len(self.c2i)))
 
 		self.word_dim = params["word_dim"]
 		self.word_vocab_size = len(self.w2i)
 		self.char_dim = params["char_dim"]
 		self.char_vocab_size = len(self.c2i)
-		self.lstm_num_units = params["lstm_num_units"]		
 
-		# load word embedding		
+		print("Lengths of word and char dictionaries: {}, {}".format(self.word_vocab_size, self.char_vocab_size))	
+
 		self.word_emb = np.zeros(shape=(self.word_vocab_size, self.word_dim))		
+		# load word embedding		
 		if "word_emb" in params:
-			print("pre-trained word embedding is being loaded ...")
+			print("pre-trained word embedding {} is being loaded ...".format(params["word_emb"]))
 			self.load_word_emb(params["word_emb"])
 
 		tf.reset_default_graph()
@@ -71,35 +71,47 @@ class sent_model:
 			conv = tf.nn.embedding_lookup(tf_char_embeddings,
 										  self.tf_char_ids,
 										  name="embedded_cnn_chars")
-			for ks, fil in self.params["conv"]:
-				conv = tf.layers.conv2d(inputs=conv,
+			for i, (ks, fil) in enumerate(self.params["conv"]):
+				conv = tf.layers.conv2d(inputs=conv, # sent, word, char, feature
 										filters=fil,
 										kernel_size=(1, ks),
 										strides=(1, 1),
 										padding="same",
-										name="conv_{}_{}".format(ks, fil),
+										name="conv_{}".format(i),
 										kernel_initializer=xavier_initializer_conv2d())
 
-			char_cnn = tf.reduce_max(conv, axis=2)
+			self.char_cnn = tf.reduce_max(conv, axis=2) # sent, word, cnn_feature
 			
-			self.input = tf.nn.dropout(tf.concat([self.input, char_cnn], axis=-1), self.tf_keep_prob) # [sents, words, features]
+			self.input = tf.nn.dropout(tf.concat([self.input, self.char_cnn], axis=-1), self.tf_keep_prob) # [sents, words, word_dim + cnn_features]
 
 		# Bi-LSTM to generate final input representation in combination with both left and right contexts
 		with tf.variable_scope("bi_lstm_words"):
-			cell_fw = tf.contrib.rnn.LSTMCell(self.params["lstm_num_units"])
-			cell_bw = tf.contrib.rnn.LSTMCell(self.params["lstm_num_units"])
+			cell_fw = tf.contrib.rnn.LSTMCell(self.params["word_lstm_units"])
+			cell_bw = tf.contrib.rnn.LSTMCell(self.params["word_lstm_units"])
 			(output_fw, output_bw), _ = tf.nn.bidirectional_dynamic_rnn(cell_fw, cell_bw, self.input,
 																		sequence_length=self.tf_sentence_lengths,
 																		dtype=tf.float32)			
 
 			bilstm_output = tf.concat([output_fw, output_bw], axis=-1) # [sents, words, 2*lstm_units]
 
-		with tf.variable_scope("sent_representation"):			
+			mask = tf.where(condition=tf.equal(self.tf_word_ids, self.w2i["<PAD>"]), x=tf.ones_like(self.tf_word_ids, dtype=tf.float32)*1e-30, y=tf.zeros_like(self.tf_word_ids, dtype=tf.float32))
+			mask = tf.tile(tf.expand_dims(mask, -1), (1, 1, 2*self.params["word_lstm_units"]))
+
+			bilstm_output = bilstm_output + mask
+
 			sent_rep = tf.reduce_max(bilstm_output, axis=1) # [sents, 2*lstm_units]
 
-			sent_rep = tf.layers.conv1d(inputs=sent_rep[None,:,:], filters=2*self.lstm_num_units, kernel_size=3, padding='same')			
+		# represent sents in their contexts 
+		with tf.variable_scope("sent_representation"):			
+			# sent_rep = tf.layers.conv1d(inputs=sent_rep[None, :, :], filters=2*self.lstm_num_units, kernel_size=3, padding='same')			
+			# sent_rep = tf.squeeze(sent_rep, axis=0)
+			sent_fw = tf.contrib.rnn.LSTMCell(self.params["sent_lstm_units"])
+			sent_bw = tf.contrib.rnn.LSTMCell(self.params["sent_lstm_units"])
+			(output_sent_fw, output_sent_bw), _ = tf.nn.bidirectional_dynamic_rnn(sent_fw, sent_bw, sent_rep[None, :, :],
+																		# sequence_length=self.tf_sentence_lengths,
+																		dtype=tf.float32)
+			sent_rep = tf.concat([output_sent_fw, output_sent_bw], axis=-1)
 			sent_rep = tf.squeeze(sent_rep, axis=0)
-			print("$$", sent_rep)
 
 		# with tf.variable_scope("just_pair"):
 		# 	d = tf.expand_dims(sent_rep, 0)
@@ -204,7 +216,10 @@ class sent_model:
 				current_idx = 0
 				avg_loss = []
 				while current_idx < nb_samples:
-					batch_words, real_length_sents, batch_chars, label, current_idx = self.get_batch(shuffled_idx_words, shuffled_idx_chars, shuffled_y, current_idx)
+					batch_words, real_length_sents, batch_chars, label, current_idx = self.get_batch(shuffled_idx_words, shuffled_idx_chars, shuffled_y, current_idx)					
+
+					# print("\n\n====================== input to char cnn: \n\n======================")
+					# print(batch_chars)
 
 					loss1, _ = sess.run([self.loss, self.opt], feed_dict={self.tf_word_ids: batch_words,
 					 			 										  self.tf_target_matrix: label,
@@ -213,6 +228,10 @@ class sent_model:
 					 			 										  self.tf_learning_rate: 0.001,
 					 			 										  self.tf_sentence_lengths: real_length_sents
 					 			 										  })
+
+					# print("\n\n====================== output from char cnn: \n\n======================")
+					# print(char_out)
+
 					avg_loss.append(loss1)
 
 				mean_loss = np.mean(avg_loss)
@@ -355,10 +374,6 @@ class sent_model:
 			idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent if word!=""]
 								for sent in sample] 
 								for sample in raw_x_test]			
-			# print("\n\n======================================================\n\n")
-			# print(idx_words_test[:1])
-			# print("\n\n------------------------------------------------------n\n")
-			# print(idx_chars_test[:1])
 
 			acc = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
 			print("acc on the {}: {:.4f}".format(test_file, acc))			
@@ -368,8 +383,9 @@ params = {"dicts_file": "dict.pkl",
 		  "word_dim": 100, 
 		  "word_emb": "glove.6B.100d.txt",
 		  "char_dim": 64,
-		  "conv": [[2, 64], [3, 128]],
-		  "lstm_num_units": 128,
+		  "conv": [[3, 64], [5, 128]],
+		  "word_lstm_units": 128,
+		  "sent_lstm_units": 128,
 		  "keep_prob": 0.5,
 		  "nb_epochs": 40,
 		  # "load_path":"./models/ontonotes/ontonotes",
@@ -378,21 +394,19 @@ params = {"dicts_file": "dict.pkl",
 model = sent_model(params)
 
 model.train("train1.pkl", "dev1.pkl", "test1.pkl")
-model.test("./models/ontonotes/ontonotes", "test1.pkl")
 
 # params = {"dicts_file": "qbcoref_dict.pkl",
 # 		  "word_dim": 100, 
 # 		  # "word_emb": "glove.6B.100d.txt",
 # 		  "char_dim": 64,
-#   		  "conv": [[2, 64], [3, 128], [4, 128]],
+#   		  "conv": [[3, 64], [5, 128]],
 # 		  "lstm_num_units": 128,
 # 		  "keep_prob": 0.5,
-# 		  "nb_epochs": 20,
+# 		  "nb_epochs": 40,
 # 		  # "load_path":"./models/qbcoref/qbcoref",
 # 		  "save_path": "./models/qbcoref/qbcoref"}
 
 # model = sent_model(params)
 # model.train("qbcoref_train.pkl", "qbcoref_dev.pkl", "qbcoref_test.pkl")
 # model.test("./models/qbcoref/qbcoref", "qbcoref_test.pkl")
-# # model.test("./model/ontonotes", "qbcoref_train.pkl", "out_qbcoref_train")
 
