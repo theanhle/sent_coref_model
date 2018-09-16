@@ -10,7 +10,6 @@ class sent_model:
 	def __init__(self, params=None):
 		self.params = params
 
-		self.batch_size = params["batch_size"]
 		self.keep_prob = params["keep_prob"]
 		self.nb_epochs = params["nb_epochs"]
 
@@ -28,26 +27,24 @@ class sent_model:
 		self.char_vocab_size = len(self.c2i)
 		self.lstm_num_units = params["lstm_num_units"]		
 
-		# load word embedding
-		self.word_emb = np.zeros(shape=(self.word_vocab_size, self.word_dim))
+		# load word embedding		
+		self.word_emb = np.zeros(shape=(self.word_vocab_size, self.word_dim))		
 		if "word_emb" in params:
+			print("pre-trained word embedding is being loaded ...")
 			self.load_word_emb(params["word_emb"])
 
 		tf.reset_default_graph()
 		
-		# list of real lengths of documents
-		self.tf_doc_boundaries = tf.placeholder(dtype=tf.int32, shape=[self.batch_size], name="doc_boundaries")
-
-		# [batch size, nb_words]
+		# [sent, word]
 		self.tf_word_ids = tf.placeholder(dtype=tf.int32, shape=[None, None], name="word_ids")
-		# real word lengths in sents
+		# real length sents
 		self.tf_sentence_lengths= tf.placeholder(dtype=tf.int32, shape=[None], name="sentence_lengths")
 
-		# [batch size, nb_words, nb_chars]
+		# [sent, word, char]
 		self.tf_char_ids = tf.placeholder(dtype=tf.int32, shape=[None, None, None], name="char_ids")
 
-		# output matrix with batch size: [batch size, nb_sents, nb_sents]		
-		self.tf_target_matrix = tf.placeholder(dtype=tf.int32, shape=[None, None, None], name="target_matrix")
+		# binary matrix representing the relationship between sents: [sent, sent]		
+		self.tf_target_matrix = tf.placeholder(dtype=tf.int32, shape=[None, None], name="target_matrix")
 
 		# keep_prob
 		self.tf_keep_prob = tf.placeholder(dtype=tf.float32, shape=[], name="keep_prob")
@@ -60,7 +57,7 @@ class sent_model:
 			tf_word_embeddings = tf.Variable(self.word_emb, dtype=tf.float32,
 				trainable=True, name="word_embedding")
 			embedded_words = tf.nn.embedding_lookup(tf_word_embeddings, self.tf_word_ids, name="embedded_words")
-			self.input = embedded_words
+			self.input = embedded_words # sent, word, word_dim
 
 
 		# CNN network to capture character-level features
@@ -71,36 +68,21 @@ class sent_model:
 												 trainable=True,
 												 initializer=xavier_initializer())
 
-			embedded_cnn_chars = tf.nn.embedding_lookup(tf_char_embeddings,
-															self.tf_char_ids,
-															name="embedded_cnn_chars")
-
-			conv1 = tf.layers.conv2d(inputs=embedded_cnn_chars,
-										filters=self.params["conv1"][1],
-										kernel_size=(1, self.params["conv1"][0]),
+			conv = tf.nn.embedding_lookup(tf_char_embeddings,
+										  self.tf_char_ids,
+										  name="embedded_cnn_chars")
+			for ks, fil in self.params["conv"]:
+				conv = tf.layers.conv2d(inputs=conv,
+										filters=fil,
+										kernel_size=(1, ks),
 										strides=(1, 1),
 										padding="same",
-										name="conv1",
-										kernel_initializer=xavier_initializer_conv2d())
-			conv2 = tf.layers.conv2d(inputs=conv1,
-										filters=self.params["conv2"][1],
-										kernel_size=(1, self.params["conv2"][0]),
-										strides=(1, 1),
-										padding="same",
-										name="conv2",
-										kernel_initializer=xavier_initializer_conv2d())
-			conv3 = tf.layers.conv2d(inputs=conv2,
-										filters=self.params["conv3"][1],
-										kernel_size=(1, self.params["conv3"][0]),
-										strides=(1, 1),
-										padding="same",
-										name="conv3",
+										name="conv_{}_{}".format(ks, fil),
 										kernel_initializer=xavier_initializer_conv2d())
 
-			# char_cnn = tf.nn.dropout(tf.reduce_max(conv3, axis=2), self.tf_keep_prob)
-			char_cnn = tf.reduce_max(conv3, axis=2)
+			char_cnn = tf.reduce_max(conv, axis=2)
 			
-			self.input = tf.concat([self.input, char_cnn], axis=-1) # [sents, words, features]
+			self.input = tf.nn.dropout(tf.concat([self.input, char_cnn], axis=-1), self.tf_keep_prob) # [sents, words, features]
 
 		# Bi-LSTM to generate final input representation in combination with both left and right contexts
 		with tf.variable_scope("bi_lstm_words"):
@@ -113,49 +95,36 @@ class sent_model:
 			bilstm_output = tf.concat([output_fw, output_bw], axis=-1) # [sents, words, 2*lstm_units]
 
 		with tf.variable_scope("sent_representation"):			
-			a = tf.reduce_max(bilstm_output, axis=1) # [sents, 2*lstm_units]
+			sent_rep = tf.reduce_max(bilstm_output, axis=1) # [sents, 2*lstm_units]
 
-			# pad document in order to all document in the batch have the same length (nb_sents)
-			# self.tf_doc_boundaries = tf.placeholder(dtype=tf.int32, shape=[self.batch_size])
+			sent_rep = tf.layers.conv1d(inputs=sent_rep[None,:,:], filters=2*self.lstm_num_units, kernel_size=3, padding='same')			
+			sent_rep = tf.squeeze(sent_rep, axis=0)
+			print("$$", sent_rep)
 
-			# split a into list of original documents: batch_size documents with shape: [sents_in_document, 2*lstm_units]
-			b = tf.split(a, self.tf_doc_boundaries, 0) # list of documents [sents, 2*lstm_units]
+		# with tf.variable_scope("just_pair"):
+		# 	d = tf.expand_dims(sent_rep, 0)
+		# 	e = tf.tile(d, (tf.shape(sent_rep)[0], 1, 1))
 
-			nb_sents_in_longest_doc = tf.reduce_max(self.tf_doc_boundaries)
+		# 	f = tf.expand_dims(sent_rep, 1)
+		# 	g = tf.tile(f, (1, tf.shape(sent_rep)[0], 1))
 
-			# pad document with sents of <PAD> words in order to all documents have the same length: nb_sents
-			# self.c = tf.stack([tf.pad(b[i], [[0, nb_sents_in_longest_doc-self.tf_doc_boundaries[i]], [0, 0]], constant_values=self.w2i["<PAD>"]) for i in range(len(self.b))])		
-			c = tf.stack([tf.pad(b[i], [[0, nb_sents_in_longest_doc-self.tf_doc_boundaries[i]], [0, 0]], constant_values=0) for i in range(len(b))])		
-			
-			c = tf.reshape(c, (self.batch_size, -1, 2*self.lstm_num_units))	# [nb_documents, nb_sents, 2*lstm_units]	
+		# 	# [nb_sents, nb_sents, 4*lstm_units]
+		# 	h = tf.concat([e, g], axis=-1)
 
-			c0 = tf.layers.conv1d(inputs=c, filters=256, kernel_size=5, padding='same')
-			c1 = tf.layers.conv1d(inputs=c0, filters=128, kernel_size=3, padding='same')
+		with tf.variable_scope("self_att"):
+			x = sent_rep
+			de = x.get_shape()[-1]
+			w = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="w")
+			w1 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W1")
+			w2 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W2")
+			b1 = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="b1")
+			b = tf.get_variable(dtype=tf.float32, shape=[], trainable=True, name="b")
 
-		with tf.variable_scope("just_pair"):
-			d = tf.expand_dims(c1, 1)
-			e = tf.tile(d, (1, tf.shape(c1)[1], 1, 1))
-
-			f = tf.expand_dims(c1, 2)
-			g = tf.tile(f, (1, 1, tf.shape(c1)[1], 1))
-
-			# [nb_documents, nb_sents, nb_sents, 4*lstm_units]
-			h = tf.concat([e, g], axis=-1)
-
-		# with tf.variable_scope("self_att"):
-		# 	x = c2 #b, n, de
-		# 	de = x.get_shape()[-1]
-		# 	w = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="w")
-		# 	w1 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W1")
-		# 	w2 = tf.get_variable(dtype=tf.float32, shape=[de, de], trainable=True, name="W2")
-		# 	b1 = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="b1")
-		# 	b = tf.get_variable(dtype=tf.float32, shape=[], trainable=True, name="b")
-
-		# 	e1 = tf.transpose(tf.tensordot(x, w1, axes=1), [1,0,2]) # b, n, de -> n, b, de = n, [b,de]
-		# 	e2 = tf.transpose(tf.tensordot(x, w2, axes=1), [1,0,2]) # b, n, de -> n, b, de
-		# 	tong = tf.transpose(tf.map_fn(lambda i: i + e2 + b1, e1), [2,0,1,3]) # b, n, n, de
-		# 	weight = tf.nn.softmax(tf.tensordot(tf.tanh(tong), w, axes=1) + b) # b, n, n
-		# 	h = tf.transpose(tf.map_fn(lambda y: y*x,tf.expand_dims(tf.transpose(weight, [1,0,2]), -1)), [1,0,2,3])
+			x_w1 = tf.matmul(x, w1) # n, de
+			s = tf.map_fn(lambda xj: x_w1 + tf.tensordot(w2, xj, axes=1) + b1, x) # n, n, de
+			f = tf.tensordot(tf.tanh(s), w, axes=1) + b # n, n
+			weight = tf.nn.softmax(f, axis=1) # n, n
+			h = tf.transpose(tf.map_fn(lambda weight_j: tf.transpose(x)*weight_j, weight), [0, 2, 1])
 						
 		with tf.variable_scope("loss_and_opt"):
 			self.logits = tf.nn.dropout(tf.layers.dense(inputs=h, units=2, activation=None), self.tf_keep_prob)
@@ -177,30 +146,30 @@ class sent_model:
 		[raw_x_test, raw_y_test] = pickle.load(open(test_pkl_file, "rb"))
 
 		# index words: sample -> sent -> idx_word
-		idx_words_train = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent]
+		idx_words_train = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent if word!=""]
 							for sent in sample] 
 							for sample in raw_x_train]
 
 		# index characters: sample -> sent -> word -> idx_char
-		idx_chars_train = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent]
+		idx_chars_train = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent if word!=""]
 							for sent in sample] 
 							for sample in raw_x_train]
 
-		idx_words_dev = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent]
+		idx_words_dev = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent if word!=""]
 							for sent in sample] 
 							for sample in raw_x_dev]
 
 		# index characters: sample -> sent -> word -> idx_char
-		idx_chars_dev = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent]
+		idx_chars_dev = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent if word!=""]
 							for sent in sample] 
 							for sample in raw_x_dev]							
 
-		idx_words_test = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent]
+		idx_words_test = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent if word!=""]
 							for sent in sample] 
 							for sample in raw_x_test]
 
 		# index characters: sample -> sent -> word -> idx_char
-		idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent]
+		idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent if word!=""]
 							for sent in sample] 
 							for sample in raw_x_test]							
 
@@ -235,47 +204,19 @@ class sent_model:
 				current_idx = 0
 				avg_loss = []
 				while current_idx < nb_samples:
-					batch_words, real_length_sents, batch_chars, batch_labels, current_idx, doc_boundaries = self.get_batch(shuffled_idx_words, shuffled_idx_chars, shuffled_y, current_idx)
-
-					# print("\n\n======================================================\n\n")
-					# print(batch_words)
-					# print("\n\n------------------------------------------------------n\n")
-					# print(real_length_sents)
-					# print("\n\n------------------------------------------------------n\n")
-					# print(batch_chars)
-					# print("\n\n------------------------------------------------------n\n")
-					# print(batch_labels)
-					# print("\n\n------------------------------------------------------n\n")
-					# print(doc_boundaries)
-					# print("\n\n$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$\n\n")
-					if batch_labels.shape[0] < self.batch_size:
-						break
+					batch_words, real_length_sents, batch_chars, label, current_idx = self.get_batch(shuffled_idx_words, shuffled_idx_chars, shuffled_y, current_idx)
 
 					loss1, _ = sess.run([self.loss, self.opt], feed_dict={self.tf_word_ids: batch_words,
-					 			 										  self.tf_sentence_lengths: real_length_sents,
-					 			 										  self.tf_target_matrix: batch_labels,
+					 			 										  self.tf_target_matrix: label,
 					 			 										  self.tf_keep_prob: self.keep_prob,
-					 			 										  self.tf_learning_rate: 0.001,
 					 			 										  self.tf_char_ids: batch_chars,
-					 			 										  self.tf_doc_boundaries: doc_boundaries})
+					 			 										  self.tf_learning_rate: 0.001,
+					 			 										  self.tf_sentence_lengths: real_length_sents
+					 			 										  })
 					avg_loss.append(loss1)
 
 				mean_loss = np.mean(avg_loss)
 
-				# evaluate the model performance on the dev. set
-				# acc_dev, _ = self.accuracy(sess, idx_words_dev, idx_chars_dev, raw_y_dev)
-				# acc_train, _ = self.accuracy(sess, idx_words_train, idx_chars_train, raw_y_train)
-				# acc_test, _ = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
-				# print("\n\n======================================================\n\n")
-				# print(idx_words_train[:1])
-				# print("\n\n------------------------------------------------------n\n")
-				# print(idx_chars_train[:1])
-				# print("\n\n------------------------------------------------------n\n")
-				# for i in range(5):
-				# 	print(raw_y_train[i])
-				# # for i in np.array(raw_y_train[:5]):
-				# # 	print(i.shape)
-				# print("\n\n======================================================\n\n")
 				acc_dev = self.accuracy(sess, idx_words_dev, idx_chars_dev, raw_y_dev)
 				acc_train = self.accuracy(sess, idx_words_train, idx_chars_train, raw_y_train)
 				acc_test = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
@@ -287,80 +228,21 @@ class sent_model:
 				else:
 					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {:.4f}, dev. set: {:.4f}, test. set: {:.4f}".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
 
-			# print("acc on the test set:", self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test))
-		
-
-	# def accuracy(self, sess, idx_words, idx_chars, raw_y, return_pred=False):		
-	# 	nb_samples = len(raw_y)
-
-	# 	outputs = []
-	# 	real_lengths = []
-	# 	labels = []
-
-	# 	current_idx = 0
-	# 	while current_idx < nb_samples:
-	# 		batch_words, real_length_sents, batch_chars, batch_labels, current_idx, doc_boundaries = self.get_batch(idx_words, idx_chars, raw_y, current_idx)
-	# 		if batch_labels.shape[0] < self.batch_size:
-	# 			break
-
-	# 		real_lengths.append(doc_boundaries)
-	# 		labels.append(batch_labels)
-
-	# 		out = sess.run(self.pred, feed_dict={self.tf_word_ids: batch_words,
-	# 					 					self.tf_sentence_lengths: real_length_sents,
-	# 					 					self.tf_keep_prob: 1,
-	# 										self.tf_doc_boundaries: doc_boundaries,
-	# 										self.tf_char_ids: batch_chars})
-
-	# 		real_out = []
-	# 		for o, m, l in zip(out, batch_labels, doc_boundaries):
-	# 			real_out.append([o[:l, :l], m[:l, :l]])
-
-	# 		outputs +=real_out
-
-	# 	# calculate accuracy using a particular threshold
-	# 	accuracies = []
-	# 	for a, b in outputs:				
-	# 		d = (a == b) + 0
-	# 		e = np.sum(d)
-	# 		f = np.size(d)
-	# 		g = e/f
-	# 		accuracies.append(g)
-
-	# 	avg_acc = np.mean(accuracies)
-
-	# 	if return_pred:
-	# 		return avg_acc, outputs
-	# 	else:
-	# 		return avg_acc, None	
 
 	def accuracy(self, sess, idx_words, idx_chars, raw_y):		
 		nb_samples = len(raw_y)
 
 		outputs = []
-		real_lengths = []
-		labels = []
 
 		current_idx = 0
 		while current_idx < nb_samples:
-			batch_words, real_length_sents, batch_chars, batch_labels, current_idx, doc_boundaries = self.get_batch(idx_words, idx_chars, raw_y, current_idx)
-			if batch_labels.shape[0] < self.batch_size:
-				break
-
-			real_lengths.append(doc_boundaries)
-			labels.append(batch_labels)
+			batch_words, real_length_sents, batch_chars, label, current_idx = self.get_batch(idx_words, idx_chars, raw_y, current_idx)
 
 			out = sess.run(self.pred, feed_dict={self.tf_word_ids: batch_words,
 						 					self.tf_sentence_lengths: real_length_sents,
 						 					self.tf_keep_prob: 1,
-											self.tf_doc_boundaries: doc_boundaries,
 											self.tf_char_ids: batch_chars})
-
-			real_out = []
-			for o, m, l in zip(out, batch_labels, doc_boundaries):
-				real_out.append([o[:l, :l], m[:l, :l]])
-
-			outputs +=real_out
+			outputs.append([out, label])
 
 		# calculate accuracy using a particular threshold
 		accuracies = []
@@ -375,92 +257,47 @@ class sent_model:
 
 		return avg_acc
 
-	def get_batch(self, words, chars, labels, start_idx):
-		nb_samples = len(words)
-		end_idx = start_idx + self.batch_size
-		if end_idx > nb_samples:
-			end_idx = nb_samples
+	def get_batch(self, words, chars, labels, idx):
+		# words: doc, sent, indexed_word
+		# chars: doc, sent, word, indexed_char
 
-		# # sample -> sent -> word
-		# batch_words = words[start_idx: end_idx]
-		batch_words = [[[word for word in sent] for sent in sample] for sample in words[start_idx: end_idx]]
+		batch_words = [[word for word in sent] for sent in words[idx]] # [sent, word]
 
-		# index characters: sample -> sent -> word -> idx_char
-		batch_chars = [[[[char for char in word] for word in sent] for sent in sample] for sample in chars[start_idx: end_idx]]
+		# index characters: document -> sent -> word -> idx_char
+		batch_chars = [[[char for char in word] for word in sent] for sent in chars[idx]] # [sent, word, char]
 
-		# # sample -> sent -> word -> char		
-		# batch_chars = chars[start_idx: end_idx]
-
-		# # list of matrices [nb_sents, nb_sents]
-		batch_labels = labels[start_idx: end_idx]
-		# # sample -> sent -> word
-
-		
-		
+		label = labels[idx] # [sent, sent]
 
 		# pad sentences
 		# find the number of words in the longest sentence of batch word, and store real length of sentences
-		nb_words_in_max_sent = 0
-		real_length_sents = []
-		for sample in batch_words:
-			real_length_sents += [len(sent) for sent in sample]
-			for sent in sample:				
-				if nb_words_in_max_sent < len(sent):
-					nb_words_in_max_sent = len(sent)		
-
-		real_length_sents = np.array(real_length_sents)
+		real_length_sents = np.array([len(sent) for sent in batch_words])
+		nb_words_in_max_sent = max(real_length_sents)		
 		
 		# pad sentences in order to all sentences in the batch have the same length
-		for i in range(len(batch_words)):
-			for j in range(len(batch_words[i])):
-				if len(batch_words[i][j]) < nb_words_in_max_sent:
-					batch_words[i][j] = np.lib.pad(batch_words[i][j], (0, nb_words_in_max_sent - len(batch_words[i][j])), 'constant',
-						constant_values=(self.w2i["<PAD>"], self.w2i["<PAD>"]))
-		
-		# remove document boundaries: X[nb_doc, [nb_sents], nb_words] -> X[new_nb_sents, nb_words]
-		# where new_nb_sents = sum(nb_sents) of all documents in the batch
-		new_batch_words = []
-		# keep document boundaries in order to re-split documents from the batch of sentences
-		doc_boundaries = []
-
-		for sample in batch_words:
-			doc_boundaries.append(len(sample))
-			new_batch_words += [sent for sent in sample]			
-
+		for j in range(len(batch_words)):
+			if len(batch_words[j]) < nb_words_in_max_sent:
+				batch_words[j] = np.lib.pad(batch_words[j], (0, nb_words_in_max_sent - len(batch_words[j])), 'constant',
+					constant_values=(self.w2i["<PAD>"], self.w2i["<PAD>"]))
 		# pad chars
-		nb_char_in_longest_word = 0
-		new_batch_chars = []
-		for sample in batch_chars:
-			new_batch_chars += [sent for sent in sample]
-			for sent in sample:
-				if len(sent) == 0:
-					continue
-				longest_word = max([len(word) for word in sent])
-				if longest_word > nb_char_in_longest_word:
-					nb_char_in_longest_word = longest_word		
+		nb_chars_in_longest_word = 0
+		for sent in batch_chars:
+			max_len = max([len(word) for word in sent])
+			if max_len > nb_chars_in_longest_word:
+				nb_chars_in_longest_word = max_len
 
-		for s in range(len(new_batch_chars)):
-			nb_words = len(new_batch_chars[s])
-			for w in range(nb_words):
-				if len(new_batch_chars[s][w]) < nb_char_in_longest_word:
-					new_batch_chars[s][w] += [self.c2i["<PAD>"]]*(nb_char_in_longest_word - len(new_batch_chars[s][w]))
-			new_batch_chars[s] += [[self.c2i["<PAD>"]]*nb_char_in_longest_word]*(nb_words_in_max_sent-len(new_batch_chars[s]))
+		for i in range(len(batch_chars)):
+			for j in range(len(batch_chars[i])):
+				if len(batch_chars[i][j]) < nb_chars_in_longest_word:
+					batch_chars[i][j] +=[self.c2i["<PAD>"]]*(nb_chars_in_longest_word - len(batch_chars[i][j]))
+			if real_length_sents[i] < nb_words_in_max_sent:
+				batch_chars[i] += [[self.c2i["<PAD>"]]*nb_chars_in_longest_word]*(nb_words_in_max_sent - real_length_sents[i])		
 
-		# pad labels
-		# batch_labels: list of numpy array [nb_sents, nb_sents], sizes of these matrices are not the same
-		# -> pad to [nb_samples, nb_sents, nb_sents]
-		size_of_largest_matrix = max([m.shape[0] for m in batch_labels])
-		
-		for i in range(len(batch_labels)):
-			size = batch_labels[i].shape[0]
-			batch_labels[i] = np.pad(batch_labels[i], ((0, size_of_largest_matrix - size), (0, size_of_largest_matrix - size)),
-				'constant', constant_values=(0, 0))
+		batch_words = np.array(batch_words)
+		batch_chars = np.array(batch_chars)
+		label = np.array(label)				
 
-		new_batch_words = np.array(new_batch_words)
-		new_batch_chars = np.array(new_batch_chars)
-		new_batch_labels = np.array(batch_labels)				
+		return batch_words, real_length_sents, batch_chars, label, (idx + 1)
 
-		return new_batch_words, real_length_sents, new_batch_chars, new_batch_labels, end_idx, doc_boundaries
 
 	# helper functions
 	def load_word_emb(self, emb_file):
@@ -500,35 +337,6 @@ class sent_model:
 
 		print(c2i)
 
-	# def test(self, model_path, test_file, output_folder=""):
-	# 	with tf.Session() as sess:
-	# 		sess.run(tf.global_variables_initializer())
-	# 		print("Restore the best saved model.")
-	# 		saver = tf.train.Saver()
-	# 		saver.restore(sess, model_path)
-
-	# 		[raw_x_test, raw_y_test] = pickle.load(open(test_file, "rb"))
-
-	# 		# index words: sample -> sent -> idx_word
-	# 		idx_words_test = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent]
-	# 							for sent in sample] 
-	# 							for sample in raw_x_test]
-
-	# 		# index characters: sample -> sent -> word -> idx_char
-	# 		idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent]
-	# 							for sent in sample] 
-	# 							for sample in raw_x_test]			
-
-	# 		acc, outputs = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test, return_pred=output_folder!="")
-	# 		print("acc on the {}: {}".format(test_file, acc))
-			
-	# 		# save outputs to file
-	# 		if output_folder!="":
-	# 			for i in range(len(outputs)):
-	# 				np.savetxt("{}/pred{}.txt".format(output_folder, i), outputs[i][0], fmt="%d")					
-	# 				np.savetxt("{}/label{}.txt".format(output_folder, i), outputs[i][1], fmt="%d")
-	# 				np.savetxt("{}/diff{}.txt".format(output_folder, i), outputs[i][1]-outputs[i][0], fmt="%2d")
-
 	def test(self, model_path, test_file):
 		with tf.Session() as sess:
 			sess.run(tf.global_variables_initializer())
@@ -539,12 +347,12 @@ class sent_model:
 			[raw_x_test, raw_y_test] = pickle.load(open(test_file, "rb"))
 
 			# index words: sample -> sent -> idx_word
-			idx_words_test = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent]
+			idx_words_test = [[[self.w2i[word.lower()] if word.lower() in self.w2i else self.w2i["<UNK>"] for word in sent if word!=""]
 								for sent in sample] 
 								for sample in raw_x_test]
 
 			# index characters: sample -> sent -> word -> idx_char
-			idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent]
+			idx_chars_test = [[[[self.c2i[char] if char in self.c2i else self.c2i["<UNK>"] for char in word] for word in sent if word!=""]
 								for sent in sample] 
 								for sample in raw_x_test]			
 			# print("\n\n======================================================\n\n")
@@ -558,35 +366,29 @@ class sent_model:
 					
 params = {"dicts_file": "dict.pkl",
 		  "word_dim": 100, 
-		  # "word_emb": "../../Documents/ner/pretrained_embeddings/glove.6B.100d.txt",
-		  "char_dim": 32,
-		  "conv1": [2, 32],
-		  "conv2": [3, 64],
-		  "conv3": [4, 64],
+		  "word_emb": "glove.6B.100d.txt",
+		  "char_dim": 64,
+		  "conv": [[2, 64], [3, 128]],
 		  "lstm_num_units": 128,
 		  "keep_prob": 0.5,
-		  "batch_size": 1,
-		  "nb_epochs": 20,
+		  "nb_epochs": 40,
 		  # "load_path":"./models/ontonotes/ontonotes",
 		  "save_path": "./models/ontonotes/ontonotes"}
 
 model = sent_model(params)
 
-model.train("train.pkl", "dev.pkl", "test.pkl")
-model.test("./models/ontonotes/ontonotes", "test.pkl")
+model.train("train1.pkl", "dev1.pkl", "test1.pkl")
+model.test("./models/ontonotes/ontonotes", "test1.pkl")
 
 # params = {"dicts_file": "qbcoref_dict.pkl",
 # 		  "word_dim": 100, 
-# 		  # "word_emb": "../../Documents/ner/pretrained_embeddings/glove.6B.100d.txt",
+# 		  # "word_emb": "glove.6B.100d.txt",
 # 		  "char_dim": 64,
-# 		  "conv1": [2, 64],
-# 		  "conv2": [3, 128],
-# 		  "conv3": [4, 128],
+#   		  "conv": [[2, 64], [3, 128], [4, 128]],
 # 		  "lstm_num_units": 128,
 # 		  "keep_prob": 0.5,
-# 		  "batch_size": 5,
 # 		  "nb_epochs": 20,
-# 		  "load_path":"./models/qbcoref/qbcoref",
+# 		  # "load_path":"./models/qbcoref/qbcoref",
 # 		  "save_path": "./models/qbcoref/qbcoref"}
 
 # model = sent_model(params)
