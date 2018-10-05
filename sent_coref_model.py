@@ -8,6 +8,11 @@ from tensorflow.contrib.layers import xavier_initializer, xavier_initializer_con
 
 class sent_model:
 	def __init__(self, params=None):
+		self.log_dis = {}
+		self.log_dis[0] = [0, 0]
+		for i in range(1, 10):
+			self.log_dis[i] = [self.log_dis[i-1][1] + 1, self.log_dis[i-1][1] + 2**i]		
+
 		self.params = params
 
 		self.keep_prob = params["keep_prob"]
@@ -82,11 +87,12 @@ class sent_model:
 										padding="same",
 										name="conv_{}".format(i),
 										kernel_initializer=xavier_initializer_conv2d())
-
+			# sent, word, char, cnn_feature
+			# shape = tf.shape(conv)
+			# conv = tf.nn.dropout(x=conv, keep_prob=self.tf_keep_prob, noise_shape=[shape[0], 1, shape[2], shape[3]])
+			# conv = tf.nn.dropout(x=conv, keep_prob=self.tf_keep_prob)
 			self.char_cnn = tf.reduce_max(conv, axis=2) # sent, word, cnn_feature
-			
 			self.input = tf.nn.dropout(tf.concat([self.input, self.char_cnn], axis=-1), self.tf_keep_prob) # [sents, words, word_dim + cnn_features]
-			# self.input = tf.concat([self.input, self.char_cnn], axis=-1) # [sents, words, word_dim + cnn_features]
 
 		# Bi-LSTM to generate final input representation in combination with both left and right contexts
 		with tf.variable_scope("bi_lstm_words"):
@@ -98,11 +104,11 @@ class sent_model:
 
 			bilstm_output = tf.concat([output_fw, output_bw], axis=-1) # [sents, words, 2*lstm_units]
 
-			mask = tf.where(condition=tf.equal(self.tf_word_ids, self.w2i["<PAD>"]), x=-1e30*tf.ones_like(self.tf_word_ids, dtype=tf.float32), y=tf.zeros_like(self.tf_word_ids, dtype=tf.float32))
+			mask = tf.where(condition=tf.equal(self.tf_word_ids, self.w2i["<PAD>"]), x=-1e10*tf.ones_like(self.tf_word_ids, dtype=tf.float32), y=tf.zeros_like(self.tf_word_ids, dtype=tf.float32))
 			mask = tf.tile(tf.expand_dims(mask, -1), (1, 1, 2*self.params["word_lstm_units"]))
 
 			bilstm_output = bilstm_output + mask
-
+			# bilstm_output = tf.nn.dropout(tf.reduce_max(bilstm_output, axis=1), self.tf_keep_prob) # [sents, 2*word_lstm_units]
 			bilstm_output = tf.reduce_max(bilstm_output, axis=1) # [sents, 2*word_lstm_units]
 
 		# represent sents in their contexts 
@@ -118,29 +124,6 @@ class sent_model:
 
 			sent_rep = tf.squeeze(sent_bilstm, axis=0) # [sents, 2*sent_lstm_units]
 
-			# sent_bilstm = tf.squeeze(sent_bilstm, axis=0)
-			# sent_rep = bilstm_output + sent_bilstm
-		
-		# with tf.variable_scope("sent_distance"):
-		# 	distant_embeddings = tf.get_variable(name="distant_embeddings",
-		# 										 dtype=tf.float32,
-		# 										 shape=[1000, 20],
-		# 										 trainable=True,
-		# 										 #initializer=xavier_initializer()
-		# 										 )
-		# 	embedded_disant_sent = tf.nn.embedding_lookup(distant_embeddings, self.tf_distant_sents, name="embedded_disant_sent")
-		# 	sent_rep = tf.concat([sent_rep, embedded_disant_sent], axis=-1) # [sents, 4*lstm_units + 20]
-
-		# with tf.variable_scope("just_pair"):
-		# 	d = tf.expand_dims(sent_rep, 0)
-		# 	e = tf.tile(d, (tf.shape(sent_rep)[0], 1, 1))
-
-		# 	f = tf.expand_dims(sent_rep, 1)
-		# 	g = tf.tile(f, (1, tf.shape(sent_rep)[0], 1))
-
-		# 	# [nb_sents, nb_sents, 4*lstm_units]
-		# 	h = tf.concat([e, g], axis=-1)
-
 		with tf.variable_scope("self_att"):
 			distant_embeddings = tf.get_variable(name="distant_embeddings",
 												 dtype=tf.float32,
@@ -150,7 +133,6 @@ class sent_model:
 												 )
 			embedded_disant_sent = tf.nn.embedding_lookup(distant_embeddings, self.tf_distant_sents, name="embedded_disant_sent") # [sent, sent, 20]
 
-			# h = tf.concat([h, embedded_disant_sent], axis=-1) # [sents, sents, 4*lstm_units + 30]
 			x = sent_rep
 			de = x.get_shape()[-1]
 			w = tf.get_variable(dtype=tf.float32, shape=[de], trainable=True, name="w")
@@ -164,17 +146,7 @@ class sent_model:
 			s = s + tf.layers.dense(embedded_disant_sent, de, use_bias=False, reuse=tf.AUTO_REUSE)
 			f = tf.tensordot(tf.tanh(s), w, axes=1) + b # n, n
 			weight = tf.nn.softmax(f, axis=1) # n, n
-			h = tf.transpose(tf.map_fn(lambda weight_j: tf.transpose(x)*weight_j, weight), [0, 2, 1]) # [sents, sents, 4*sent_lstm_units]			
-
-		# with tf.variable_scope("sent_distance"):
-		# 	distant_embeddings = tf.get_variable(name="distant_embeddings",
-		# 										 dtype=tf.float32,
-		# 										 shape=[10, 40],
-		# 										 trainable=True,
-		# 										 initializer=xavier_initializer()
-		# 										 )
-		# 	embedded_disant_sent = tf.nn.embedding_lookup(distant_embeddings, self.tf_distant_sents, name="embedded_disant_sent") # [sent, sent, 20]
-		# 	h = tf.concat([h, embedded_disant_sent], axis=-1) # [sents, sents, 4*lstm_units + 30]
+			h = tf.transpose(tf.map_fn(lambda weight_j: tf.transpose(x)*weight_j, weight), [0, 2, 1]) # [sents, sents, 4*sent_lstm_units]
 						
 		with tf.variable_scope("loss_and_opt"):
 			self.logits = tf.nn.dropout(tf.layers.dense(inputs=h, units=2, activation=None), self.tf_keep_prob)
@@ -276,9 +248,10 @@ class sent_model:
 				acc_test = self.accuracy(sess, idx_words_test, idx_chars_test, raw_y_test)
 
 				if max_acc < acc_dev:
-					saver.save(sess, self.params["save_path"])
+					if "save_path" in self.params:
+						saver.save(sess, self.params["save_path"])
 					max_acc = acc_dev
-					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {:.4f}, dev. set: {:.4f}, test. set: {:.4f} (Saved)".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
+					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {:.4f}, dev. set: {:.4f}, test. set: {:.4f} (*)".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
 				else:
 					print("Epoch {:2d} | Loss {:.4f} | Acc on the training set: {:.4f}, dev. set: {:.4f}, test. set: {:.4f}".format(epoch, mean_loss, acc_train, acc_dev, acc_test))
 
@@ -367,27 +340,21 @@ class sent_model:
 
 		# distant_sents = [i//20 for i in np.arange(batch_words.shape[0])]		
 		
-		distant_sents = sent_model.create_log_distances(batch_words.shape[0])
+		distant_sents = self.create_log_distances(batch_words.shape[0])
 
 		return batch_words, real_length_sents, batch_chars, label, (idx + 1), distant_sents
 
-	@staticmethod
-	def create_log_distances(nb_sents):
-			distances = np.zeros((nb_sents, nb_sents))
-			for i in range(nb_sents):
-				for j in range(nb_sents):
-					distances[i, j] = abs(i-j)
+	def create_log_distances(self, nb_sents):
+		distances = np.zeros((nb_sents, nb_sents))
+		for i in range(nb_sents):
+			for j in range(nb_sents):
+				distances[i, j] = abs(i-j)			
 
-			log_dis = {}
-			log_dis[0] = [0, 0]
-			for i in range(1, nb_sents):
-				log_dis[i] = [log_dis[i-1][1] + 1, log_dis[i-1][1] + 2**i]	
-
-			def distance_to_log_dis(distance):
-				for key in log_dis:
-					if distance >= log_dis[key][0] and distance <= log_dis[key][1]:
-						return key
-			return np.array([[distance_to_log_dis(i) for i in row] for row in distances])			
+		def distance_to_log_dis(distance):
+			for key in self.log_dis:
+				if self.log_dis[key][0] <= distance <= self.log_dis[key][1]:
+					return key
+		return np.array([[distance_to_log_dis(i) for i in row] for row in distances])
 
 	# helper functions
 	def load_word_emb(self, emb_file):
@@ -398,7 +365,7 @@ class sent_model:
 				self.word_emb[self.w2i[word]] = model[word]
 				loaded_words += 1
 
-		print("There was {} words loaded from Glove.".format(loaded_words))
+		print("There are {} words loaded from Glove.".format(loaded_words))
 
 	@staticmethod
 	def create_dicts(train_pkl_file, dev_pkl_file, output_file=None):
@@ -426,6 +393,12 @@ class sent_model:
 			pickle.dump({"w2i": w2i, "i2w": i2w, "c2i": c2i, "i2c": i2c}, open(file=output_file, mode="wb"))		
 
 		print(c2i)
+
+	@staticmethod
+	def sent_coref_dataset_statistic():
+		x, y = pickle.load(open("train.pkl", "rb"))
+		longest_doc = max(len(doc) for doc in x)
+		print(longest_doc)
 
 	def test(self, model_path, test_file, output_file=""):
 		with tf.Session() as sess:
@@ -484,28 +457,14 @@ params = {"dicts_file": "dict.pkl",
 		  "word_lstm_units": 128,
 		  "sent_lstm_units": 128,
 		  "keep_prob": 0.5,
-		  "nb_epochs": 40,
-		  "load_path":"./models/temp/ontonotes",
-		  "save_path": "./models/temp/ontonotes"}
+		  "nb_epochs": 60,
+		  # "load_path":"./models/ontonotes/ontonotes",
+		  # "save_path": "./models/ontonotes/ontonotes"
+		  }
 
 model = sent_model(params)
+model.train("train.pkl", "dev.pkl", "test.pkl")
+# model.test("./models/ontonotes/ontonotes", "test.pkl", "ontonotes_test.txt")
 
-model.train("train1.pkl", "dev1.pkl", "test1.pkl")
-# model.test("./models/temp/ontonotes", "test1.pkl", "./models/ontonotes_out.txt")
-
-# params = {"dicts_file": "qbcoref_dict.pkl",
-# 		  "word_dim": 100, 
-# 		  # "word_emb": "glove.6B.100d.txt",
-# 		  "char_dim": 64,
-#   		  "conv": [[3, 64], [3, 64]],
-# 		  "word_lstm_units": 128,
-# 		  "sent_lstm_units": 128,
-# 		  "keep_prob": 0.5,
-# 		  "nb_epochs": 40,
-# 		  # "load_path":"./models/qbcoref/qbcoref",
-# 		  "save_path": "./models/qbcoref/qbcoref"}
-
-# model = sent_model(params)
-# model.train("qbcoref_train.pkl", "qbcoref_dev.pkl", "qbcoref_test.pkl")
-# # model.test("./models/qbcoref/qbcoref", "qbcoref_test.pkl", "./models/qbcoref_out.txt")
-
+# sent_model.create_dicts("train.pkl", "dev.pkl", "dict.pkl")
+# sent_model.sent_coref_dataset_statistic()

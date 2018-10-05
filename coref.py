@@ -11,7 +11,7 @@ class sent_model:
 	def __init__(self, params=None):
 		self.log_dis = {}
 		self.log_dis[0] = [0, 0]
-		for i in range(1, 10):
+		for i in range(1, 11):
 			self.log_dis[i] = [self.log_dis[i-1][1] + 1, self.log_dis[i-1][1] + 2**i]		
 
 		self.params = params
@@ -93,7 +93,7 @@ class sent_model:
 			# conv = tf.nn.dropout(x=conv, keep_prob=self.tf_keep_prob, noise_shape=[shape[0], 1, shape[2], shape[3]])
 			# conv = tf.nn.dropout(x=conv, keep_prob=self.tf_keep_prob)
 			self.char_cnn = tf.reduce_max(conv, axis=2) # sent, word, cnn_feature
-			self.input = tf.nn.dropout(tf.concat([self.input, self.char_cnn], axis=-1), self.tf_keep_prob) # [sents, words, word_dim + cnn_features]
+			self.input = tf.concat([self.input, self.char_cnn], axis=-1) # [sents, words, word_dim + cnn_features]
 
 		# Bi-LSTM to generate final input representation in combination with both left and right contexts
 		with tf.variable_scope("bi_lstm_words"):
@@ -128,7 +128,7 @@ class sent_model:
 		with tf.variable_scope("self_att"):
 			distant_embeddings = tf.get_variable(name="distant_embeddings",
 												 dtype=tf.float32,
-												 shape=[10, 30],
+												 shape=[11, 30],
 												 trainable=True,
 												 initializer=xavier_initializer()
 												 )
@@ -455,14 +455,14 @@ params = {"dicts_file": "dict.pkl",
 		  "word_lstm_units": 128,
 		  "sent_lstm_units": 128,
 		  "keep_prob": 0.5,
-		  "nb_epochs": 40,
+		  "nb_epochs": 50,
 		  # "load_path":"./models/ontonotes/ontonotes",
 		  # "save_path": "./models/ontonotes/ontonotes"
 		  }
 
 model = sent_model(params)
-model.train("train1.pkl", "dev1.pkl", "test1.pkl")
-# model.test("./models/temp/ontonotes", "test1.pkl", "./models/ontonotes_out.txt")
+model.train("train.pkl", "dev.pkl", "test.pkl")
+# model.test("./models/ontonotes/ontonotes", "test1.pkl", "./models/ontonotes_out.txt")
 
 # params = {"dicts_file": "qbcoref_dict.pkl",
 # 		  "word_dim": 100, 
